@@ -46,7 +46,7 @@ def get_im_gt_name_dict(datasets, flag='valid'):
 
     return name_im_gt_list
 
-def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training=False):
+def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training=False, distributed=True):
     gos_dataloaders = []
     gos_datasets = []
 
@@ -68,10 +68,15 @@ def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training
             gos_datasets.append(gos_dataset)
 
         gos_dataset = ConcatDataset(gos_datasets)
-        sampler = DistributedSampler(gos_dataset)
-        batch_sampler_train = torch.utils.data.BatchSampler(
-            sampler, batch_size, drop_last=True)
-        dataloader = DataLoader(gos_dataset, batch_sampler=batch_sampler_train, num_workers=num_workers_)
+        
+        if distributed:
+            sampler = DistributedSampler(gos_dataset)
+            batch_sampler_train = torch.utils.data.BatchSampler(
+                sampler, batch_size, drop_last=True)
+            dataloader = DataLoader(gos_dataset, batch_sampler=batch_sampler_train, num_workers=num_workers_)
+        else:
+            dataloader = DataLoader(gos_dataset, batch_size=batch_size, shuffle=True, 
+                                   drop_last=True, num_workers=num_workers_)
 
         gos_dataloaders = dataloader
         gos_datasets = gos_dataset
@@ -79,8 +84,13 @@ def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training
     else:
         for i in range(len(name_im_gt_list)):   
             gos_dataset = OnlineDataset([name_im_gt_list[i]], transform = transforms.Compose(my_transforms), eval_ori_resolution = True)
-            sampler = DistributedSampler(gos_dataset, shuffle=False)
-            dataloader = DataLoader(gos_dataset, batch_size, sampler=sampler, drop_last=False, num_workers=num_workers_)
+            
+            if distributed:
+                sampler = DistributedSampler(gos_dataset, shuffle=False)
+                dataloader = DataLoader(gos_dataset, batch_size, sampler=sampler, drop_last=False, num_workers=num_workers_)
+            else:
+                dataloader = DataLoader(gos_dataset, batch_size=batch_size, shuffle=False, 
+                                       drop_last=False, num_workers=num_workers_)
 
             gos_dataloaders.append(dataloader)
             gos_datasets.append(gos_dataset)

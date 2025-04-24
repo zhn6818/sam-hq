@@ -1,2 +1,6 @@
 *.png
 *.pth
+train/data/
+train/pretrained_models/
+# 忽略训练输出目录
+train/work_dirs/

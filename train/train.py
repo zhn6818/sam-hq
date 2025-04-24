@@ -279,15 +279,15 @@ def get_args_parser():
     parser.add_argument("--checkpoint", type=str, required=True, 
                         help="The path to the SAM checkpoint to use for mask generation.")
     parser.add_argument("--device", type=str, default="cuda", 
-                        help="The device to run generation on.")
+                        help="The device to run generation on. Options: 'cuda', 'mps', 'cpu'")
 
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--learning_rate', default=1e-3, type=float)
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--lr_drop_epoch', default=10, type=int)
     parser.add_argument('--max_epoch_num', default=12, type=int)
-    parser.add_argument('--input_size', default=[1024,1024], type=list)
-    parser.add_argument('--batch_size_train', default=4, type=int)
+    parser.add_argument('--input_size', default=[512,512], type=list)
+    parser.add_argument('--batch_size_train', default=2, type=int)
     parser.add_argument('--batch_size_valid', default=1, type=int)
     parser.add_argument('--model_save_fre', default=1, type=int)
 
@@ -308,8 +308,24 @@ def get_args_parser():
 
 
 def main(net, train_datasets, valid_datasets, args):
-
-    misc.init_distributed_mode(args)
+    # 修改分布式初始化逻辑，为MPS设备提供特殊处理
+    if args.device == "mps":
+        # MPS设备不支持分布式训练，设置为单进程模式
+        args.distributed = False
+        args.world_size = 1
+        args.rank = 0
+        args.local_rank = 0
+        print("MPS device detected, running in single-process mode")
+        
+        # 设置环境变量以启用CPU回退
+        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        print("Set PYTORCH_ENABLE_MPS_FALLBACK=1 to enable CPU fallback for unsupported operations")
+        
+    else:
+        # 对于CUDA和CPU，使用原有的分布式初始化
+        misc.init_distributed_mode(args)
+        args.distributed = args.world_size > 1
+        
     print('world size: {}'.format(args.world_size))
     print('rank: {}'.format(args.rank))
     print('local_rank: {}'.format(args.local_rank))
@@ -320,36 +336,59 @@ def main(net, train_datasets, valid_datasets, args):
     np.random.seed(seed)
     random.seed(seed)
 
+    # 检测设备类型
+    if args.device == "cuda" and torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using CUDA device")
+    elif args.device == "mps" and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using MPS device")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU device")
+    
+    args.device = device
+
     ### --- Step 1: Train or Valid dataset ---
     if not args.eval:
         print("--- create training dataloader ---")
         train_im_gt_list = get_im_gt_name_dict(train_datasets, flag="train")
+        
+        # 修改创建数据加载器的逻辑，根据设备类型选择不同的采样器
         train_dataloaders, train_datasets = create_dataloaders(train_im_gt_list,
                                                         my_transforms = [
                                                                     RandomHFlip(),
                                                                     LargeScaleJitter()
                                                                     ],
                                                         batch_size = args.batch_size_train,
-                                                        training = True)
+                                                        training = True,
+                                                        distributed = args.distributed)
+                                                        
         print(len(train_dataloaders), " train dataloaders created")
 
     print("--- create valid dataloader ---")
     valid_im_gt_list = get_im_gt_name_dict(valid_datasets, flag="valid")
+    # 验证数据加载器也需要根据设备类型选择不同的采样器
     valid_dataloaders, valid_datasets = create_dataloaders(valid_im_gt_list,
                                                           my_transforms = [
                                                                         Resize(args.input_size)
                                                                     ],
                                                           batch_size=args.batch_size_valid,
-                                                          training=False)
+                                                          training=False,
+                                                          distributed=args.distributed)
     print(len(valid_dataloaders), " valid dataloaders created")
     
     ### --- Step 2: DistributedDataParallel---
-    if torch.cuda.is_available():
-        net.cuda()
-    net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
-    net_without_ddp = net.module
+    net = net.to(device)
+    
+    # 只在分布式模式下使用DistributedDataParallel
+    if args.distributed:
+        net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
+        net_without_ddp = net.module
+    else:
+        # 在非分布式模式下直接使用模型
+        net_without_ddp = net
 
- 
     ### --- Step 3: Train or Evaluate ---
     if not args.eval:
         print("--- define optimizer ---")
@@ -360,15 +399,15 @@ def main(net, train_datasets, valid_datasets, args):
         train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler)
     else:
         sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
-        _ = sam.to(device=args.device)
-        sam = torch.nn.parallel.DistributedDataParallel(sam, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
+        sam = sam.to(device)
+        
+        # 只在分布式模式下使用DistributedDataParallel
+        if args.distributed:
+            sam = torch.nn.parallel.DistributedDataParallel(sam, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
 
         if args.restore_model:
             print("restore model from:", args.restore_model)
-            if torch.cuda.is_available():
-                net_without_ddp.load_state_dict(torch.load(args.restore_model))
-            else:
-                net_without_ddp.load_state_dict(torch.load(args.restore_model,map_location="cpu"))
+            net_without_ddp.load_state_dict(torch.load(args.restore_model, map_location=device))
     
         evaluate(args, net, sam, valid_dataloaders, args.visualize)
 
@@ -382,22 +421,27 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
     train_num = len(train_dataloaders)
 
     net.train()
-    _ = net.to(device=args.device)
+    device = args.device
     
     sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
-    _ = sam.to(device=args.device)
-    sam = torch.nn.parallel.DistributedDataParallel(sam, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
+    sam = sam.to(device)
+    
+    # 只在分布式模式下使用DistributedDataParallel
+    if args.distributed:
+        sam = torch.nn.parallel.DistributedDataParallel(sam, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
     
     for epoch in range(epoch_start,epoch_num): 
         print("epoch:   ",epoch, "  learning rate:  ", optimizer.param_groups[0]["lr"])
         metric_logger = misc.MetricLogger(delimiter="  ")
-        train_dataloaders.batch_sampler.sampler.set_epoch(epoch)
+        
+        # 只在分布式训练时设置epoch
+        if args.distributed and hasattr(train_dataloaders, 'sampler'):
+            train_dataloaders.sampler.set_epoch(epoch)
 
-        for data in metric_logger.log_every(train_dataloaders,1000):
+        for data in metric_logger.log_every(train_dataloaders,1):
             inputs, labels = data['image'], data['label']
-            if torch.cuda.is_available():
-                inputs = inputs.cuda()
-                labels = labels.cuda()
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
             imgs = inputs.permute(0, 2, 3, 1).cpu().numpy()
             
@@ -415,7 +459,7 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
             batched_input = []
             for b_i in range(len(imgs)):
                 dict_input = dict()
-                input_image = torch.as_tensor(imgs[b_i].astype(dtype=np.uint8), device=sam.device).permute(2, 0, 1).contiguous()
+                input_image = torch.as_tensor(imgs[b_i].astype(dtype=np.uint8), device=device).permute(2, 0, 1).contiguous()
                 dict_input['image'] = input_image 
                 input_type = random.choice(input_keys)
                 if input_type == 'box':
@@ -481,7 +525,10 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         if epoch % args.model_save_fre == 0:
             model_name = "/epoch_"+str(epoch)+".pth"
             print('come here save at', args.output + model_name)
-            misc.save_on_master(net.module.state_dict(), args.output + model_name)
+            if hasattr(net, 'module'):
+                misc.save_on_master(net.module.state_dict(), args.output + model_name)
+            else:
+                misc.save_on_master(net.state_dict(), args.output + model_name)
     
     # Finish training
     print("Training Reaches The Maximum Epoch Number")
