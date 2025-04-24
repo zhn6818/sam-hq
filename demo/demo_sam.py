@@ -2,8 +2,13 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import cv2
-from segment_anything import sam_model_registry_baseline, SamPredictor
 import os
+import sys
+
+# 添加项目根目录到 Python 路径
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from segment_anything import sam_model_registry_baseline, SamPredictor
 
 def show_mask(mask, ax, random_color=False):
     if random_color:
@@ -58,7 +63,7 @@ def show_res_multi(masks, scores, input_point, input_label, input_box, filename,
 if __name__ == "__main__":
     sam_checkpoint = "./pretrained_checkpoint/sam_vit_l_0b3195.pth"
     model_type = "vit_l"
-    device = "cuda"
+    device = "mps"
     sam = sam_model_registry_baseline[model_type](checkpoint=sam_checkpoint)
     sam.to(device=device)
     predictor = SamPredictor(sam)
