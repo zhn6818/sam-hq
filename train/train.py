@@ -303,8 +303,24 @@ def get_args_parser():
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument("--restore-model", type=str,
                         help="The path to the hq_decoder training checkpoint for evaluation")
-    parser.add_argument('--threshold_values', nargs='+', type=float, default=[0.0],
+    parser.add_argument('--threshold_values', nargs='+', type=float, default=[0.5],
                         help="一个或多个用于生成掩码的阈值 (范围: 0.0-1.0)。默认只使用0.0阈值。提供多个值将在评估和可视化时使用所有阈值。")
+
+    # 添加新参数
+    parser.add_argument('--finetune_vit', action='store_true', 
+                        help='是否微调ViT主干网络')
+    parser.add_argument('--vit_learning_rate', default=1e-5, type=float,
+                        help='ViT主干网络的学习率，通常应小于decoder的学习率')
+    parser.add_argument('--gradient_accumulation_steps', default=1, type=int,
+                        help='梯度累积步数，用于模拟更大的批次')
+    parser.add_argument('--lr_scheduler', default='step', type=str, choices=['step', 'cosine'],
+                        help='学习率调度器类型: step或cosine')
+    parser.add_argument('--warmup_epochs', default=0, type=int,
+                        help='学习率预热的epoch数')
+    parser.add_argument('--weight_decay', default=0.0, type=float,
+                        help='权重衰减系数')
+    parser.add_argument('--freeze_image_encoder_layers', default=0, type=int,
+                        help='冻结ViT编码器的前N层，0表示不冻结任何层')
 
     return parser.parse_args()
 
@@ -394,11 +410,75 @@ def main(net, train_datasets, valid_datasets, args):
     ### --- Step 3: Train or Evaluate ---
     if not args.eval:
         print("--- define optimizer ---")
-        optimizer = optim.Adam(net_without_ddp.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
-        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop_epoch)
+        
+        # 加载SAM模型用于训练
+        sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
+        sam = sam.to(device)
+        
+        # 设置参数组，分别为ViT和Decoder设置不同的学习率
+        param_groups = []
+        
+        # 如果微调ViT，添加ViT参数组
+        if args.finetune_vit:
+            print("将微调ViT主干网络，学习率:", args.vit_learning_rate)
+            
+            # 冻结指定层数的ViT编码器层
+            if args.freeze_image_encoder_layers > 0:
+                print(f"冻结ViT编码器的前 {args.freeze_image_encoder_layers} 层")
+                for i, block in enumerate(sam.image_encoder.blocks):
+                    if i < args.freeze_image_encoder_layers:
+                        for param in block.parameters():
+                            param.requires_grad = False
+            
+            # 添加ViT参数到优化器
+            vit_params = [p for p in sam.image_encoder.parameters() if p.requires_grad]
+            param_groups.append({"params": vit_params, "lr": args.vit_learning_rate})
+            
+            # 将SAM模型设置为训练模式
+            sam.train()
+        else:
+            # 如果不微调ViT，冻结所有ViT参数
+            for param in sam.image_encoder.parameters():
+                param.requires_grad = False
+            sam.eval()  # 评估模式下，dropout和batchnorm层不会更新
+        
+        # 添加Decoder参数组
+        decoder_params = [p for p in net_without_ddp.parameters() if p.requires_grad]
+        param_groups.append({"params": decoder_params, "lr": args.learning_rate})
+        
+        # 创建优化器
+        optimizer = optim.Adam(
+            param_groups, 
+            betas=(0.9, 0.999), 
+            eps=1e-08, 
+            weight_decay=args.weight_decay
+        )
+        
+        # 创建学习率调度器
+        if args.lr_scheduler == 'step':
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop_epoch)
+        else:  # cosine
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=args.max_epoch_num - args.warmup_epochs
+            )
+        
+        # 添加预热调度器
+        if args.warmup_epochs > 0:
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, 
+                start_factor=0.1, 
+                end_factor=1.0, 
+                total_iters=args.warmup_epochs
+            )
+            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, lr_scheduler],
+                milestones=[args.warmup_epochs]
+            )
+        
         lr_scheduler.last_epoch = args.start_epoch
 
-        train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler)
+        train(args, net, sam, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler)
     else:
         sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
         sam = sam.to(device)
@@ -419,7 +499,7 @@ def main(net, train_datasets, valid_datasets, args):
         evaluate(args, net, sam, valid_dataloaders, args.visualize)
 
 
-def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler):
+def train(args, net, sam, optimizer, train_dataloaders, valid_dataloaders, lr_scheduler):
     if misc.is_main_process():
         os.makedirs(args.output, exist_ok=True)
 
@@ -428,17 +508,23 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
     train_num = len(train_dataloaders)
 
     net.train()
+    # 如果微调ViT，设置为训练模式，否则设置为评估模式
+    if args.finetune_vit:
+        sam.train()
+    else:
+        sam.eval()
+        
     device = args.device
     
-    sam = sam_model_registry[args.model_type](checkpoint=args.checkpoint)
-    sam = sam.to(device)
-    
-    # 只在分布式模式下使用DistributedDataParallel
-    if args.distributed:
+    # 如果微调ViT，将sam包装为DDP
+    if args.finetune_vit and args.distributed:
         sam = torch.nn.parallel.DistributedDataParallel(sam, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
     
     for epoch in range(epoch_start,epoch_num): 
-        print("epoch:   ",epoch, "  learning rate:  ", optimizer.param_groups[0]["lr"])
+        print("epoch:   ",epoch, "  learning rate:  ", optimizer.param_groups[-1]["lr"])
+        if len(optimizer.param_groups) > 1:
+            print("  vit learning rate:  ", optimizer.param_groups[0]["lr"])
+            
         metric_logger = misc.MetricLogger(delimiter="  ")
         
         # 修复分布式训练中的set_epoch问题
@@ -452,7 +538,11 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
                     if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
                         loader.sampler.set_epoch(epoch)
 
-        for data in metric_logger.log_every(train_dataloaders,1):
+        # 用于梯度累积的计数器
+        accumulation_steps = 0
+        optimizer.zero_grad()
+        
+        for data in metric_logger.log_every(train_dataloaders, 1):
             inputs, labels = data['image'], data['label']
             inputs = inputs.to(device)
             labels = labels.to(device)
@@ -497,8 +587,14 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
                 dict_input['original_size'] = imgs[b_i].shape[:2]
                 batched_input.append(dict_input)
 
-            with torch.no_grad():
+            # 根据是否微调ViT使用不同的前向传播方式
+            if args.finetune_vit:
+                # 如果微调ViT，使用正常的前向传播并计算梯度
                 batched_output, interm_embeddings = sam(batched_input, multimask_output=False)
+            else:
+                # 如果不微调ViT，使用torch.no_grad()避免计算ViT的梯度
+                with torch.no_grad():
+                    batched_output, interm_embeddings = sam(batched_input, multimask_output=False)
             
             batch_len = len(batched_output)
             encoder_embedding = torch.cat([batched_output[i_l]['encoder_embedding'] for i_l in range(batch_len)], dim=0)
@@ -519,19 +615,33 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
             loss_mask, loss_dice = loss_masks(masks_hq, labels/255.0, len(masks_hq))
             loss = loss_mask + loss_dice
             
-            loss_dict = {"loss_mask": loss_mask, "loss_dice":loss_dice}
+            # 梯度累积 - 将损失除以累积步数
+            loss = loss / args.gradient_accumulation_steps
+            
+            loss_dict = {"loss_mask": loss_mask, "loss_dice": loss_dice}
 
             # reduce losses over all GPUs for logging purposes
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             losses_reduced_scaled = sum(loss_dict_reduced.values())
             loss_value = losses_reduced_scaled.item()
 
-            optimizer.zero_grad()
+            # 反向传播
             loss.backward()
-            optimizer.step()
+            
+            # 梯度累积计数
+            accumulation_steps += 1
+            
+            # 当达到累积步数时更新参数
+            if accumulation_steps % args.gradient_accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
             metric_logger.update(training_loss=loss_value, **loss_dict_reduced)
 
+        # 确保最后一个批次的梯度也被应用
+        if accumulation_steps % args.gradient_accumulation_steps != 0:
+            optimizer.step()
+            optimizer.zero_grad()
 
         print("Finished epoch:      ", epoch)
         metric_logger.synchronize_between_processes()
@@ -549,28 +659,57 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         args.threshold_values = original_threshold_values
         train_stats.update(test_stats)
         
-        net.train()  
+        # 恢复训练模式
+        net.train()
+        if args.finetune_vit:
+            sam.train()
+        else:
+            sam.eval()
 
         if epoch % args.model_save_fre == 0:
+            # 保存HQ-Decoder模型
             model_name = "/epoch_"+str(epoch)+".pth"
-            print('come here save at', args.output + model_name)
+            print('保存HQ-Decoder模型到', args.output + model_name)
             if hasattr(net, 'module'):
                 misc.save_on_master(net.module.state_dict(), args.output + model_name)
             else:
                 misc.save_on_master(net.state_dict(), args.output + model_name)
+            
+            # 如果微调了ViT，也保存完整的SAM模型
+            if args.finetune_vit:
+                sam_model_name = "/sam_vit_finetuned_epoch_"+str(epoch)+".pth"
+                print('保存微调后的SAM模型到', args.output + sam_model_name)
+                if hasattr(sam, 'module'):
+                    misc.save_on_master(sam.module.state_dict(), args.output + sam_model_name)
+                else:
+                    misc.save_on_master(sam.state_dict(), args.output + sam_model_name)
     
     # Finish training
     print("Training Reaches The Maximum Epoch Number")
     
-    # merge sam and hq_decoder
+    # 合并SAM和HQ-Decoder
     if misc.is_main_process():
-        sam_ckpt = torch.load(args.checkpoint)
+        if args.finetune_vit:
+            # 如果微调了ViT，直接使用微调后的SAM模型
+            if hasattr(sam, 'module'):
+                sam_ckpt = sam.module.state_dict()
+            else:
+                sam_ckpt = sam.state_dict()
+        else:
+            # 否则加载原始SAM模型并合并HQ-Decoder
+            sam_ckpt = torch.load(args.checkpoint)
+            
+        # 加载最终的HQ-Decoder
         hq_decoder = torch.load(args.output + model_name)
+        
+        # 合并HQ-Decoder到SAM模型
         for key in hq_decoder.keys():
             sam_key = 'mask_decoder.'+key
             if sam_key not in sam_ckpt.keys():
                 sam_ckpt[sam_key] = hq_decoder[key]
-        model_name = "/sam_hq_epoch_"+str(epoch)+".pth"
+                
+        # 保存最终的完整模型
+        model_name = "/sam_hq_final.pth"
         torch.save(sam_ckpt, args.output + model_name)
 
 

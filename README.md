@@ -317,3 +317,8 @@ Related high-quality instance segmentation work:
 - Thanks [SAM](https://github.com/facebookresearch/segment-anything), [Grounded SAM](https://github.com/IDEA-Research/Grounded-Segment-Anything) and [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) for their public code and released models.
 
 ## python train.py --device mps --checkpoint  ./pretrained_checkpoint/sam_vit_l_0b3195.pth --model-type vit_l --output work_dirs/hq_sam_l 
+## python train.py --device mps --checkpoint  ./pretrained_checkpoint/sam_vit_l_0b3195.pth --model-type vit_l --output work_dirs/hq_sam_l --finetune_vit --vit_learning_rate 1e-5
+## python train.py --device mps --checkpoint  ./pretrained_checkpoint/sam_vit_b_01ec64.pth --model-type vit_b --output work_dirs/hq_sam_b --finetune_vit --vit_learning_rate 1e-5
+## python train/train.py --output ./output --model-type vit_l --checkpoint ./pretrained_checkpoint/sam_vit_l.pth --device cuda --finetune_vit --vit_learning_rate 1e-5 --freeze_image_encoder_layers 8
+## python train/train.py --output ./output --model-type vit_l --checkpoint ./pretrained_checkpoint/sam_vit_l.pth --device cuda --finetune_vit --vit_learning_rate 1e-5 --gradient_accumulation_steps 4 --lr_scheduler cosine --warmup_epochs 1
+## python train/train.py --output ./output --model-type vit_l --checkpoint ./pretrained_checkpoint/sam_vit_l.pth --device cuda --finetune_vit --vit_learning_rate 1e-5
