@@ -315,3 +315,5 @@ Related high-quality instance segmentation work:
 
 ## Acknowledgments
 - Thanks [SAM](https://github.com/facebookresearch/segment-anything), [Grounded SAM](https://github.com/IDEA-Research/Grounded-Segment-Anything) and [MobileSAM](https://github.com/ChaoningZhang/MobileSAM) for their public code and released models.
+
+## python train.py --device mps --checkpoint  ./pretrained_checkpoint/sam_vit_l_0b3195.pth --model-type vit_l --output work_dirs/hq_sam_l 

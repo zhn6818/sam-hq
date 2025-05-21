@@ -7,7 +7,7 @@ export PYTORCH_ENABLE_MPS_FALLBACK=1
 mkdir -p work_dirs/hq_sam_b_vis
 
 # 评估HQ-SAM模型并生成可视化结果
-python train/train.py \
+python train.py \
   --device mps \
   --checkpoint ./pretrained_checkpoint/sam_vit_b_01ec64.pth \
   --model-type vit_b \

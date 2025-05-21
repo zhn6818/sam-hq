@@ -286,8 +286,8 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--lr_drop_epoch', default=10, type=int)
     parser.add_argument('--max_epoch_num', default=12, type=int)
-    parser.add_argument('--input_size', default=[512,512], type=list)
-    parser.add_argument('--batch_size_train', default=2, type=int)
+    parser.add_argument('--input_size', default=[1024,1024], type=list)
+    parser.add_argument('--batch_size_train', default=4, type=int)
     parser.add_argument('--batch_size_valid', default=1, type=int)
     parser.add_argument('--model_save_fre', default=1, type=int)
 
@@ -303,6 +303,8 @@ def get_args_parser():
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument("--restore-model", type=str,
                         help="The path to the hq_decoder training checkpoint for evaluation")
+    parser.add_argument('--threshold_values', nargs='+', type=float, default=[0.0],
+                        help="一个或多个用于生成掩码的阈值 (范围: 0.0-1.0)。默认只使用0.0阈值。提供多个值将在评估和可视化时使用所有阈值。")
 
     return parser.parse_args()
 
@@ -408,7 +410,12 @@ def main(net, train_datasets, valid_datasets, args):
         if args.restore_model:
             print("restore model from:", args.restore_model)
             net_without_ddp.load_state_dict(torch.load(args.restore_model, map_location=device))
-    
+        
+        # 打印评估时使用的阈值设置
+        print(f"使用阈值列表: {args.threshold_values}")
+        if len(args.threshold_values) > 1:
+            print(f"将使用 {args.threshold_values[0]} 作为主评估指标，所有阈值都将用于可视化")
+        
         evaluate(args, net, sam, valid_dataloaders, args.visualize)
 
 
@@ -434,9 +441,16 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         print("epoch:   ",epoch, "  learning rate:  ", optimizer.param_groups[0]["lr"])
         metric_logger = misc.MetricLogger(delimiter="  ")
         
-        # 只在分布式训练时设置epoch
-        if args.distributed and hasattr(train_dataloaders, 'sampler'):
-            train_dataloaders.sampler.set_epoch(epoch)
+        # 修复分布式训练中的set_epoch问题
+        if args.distributed:
+            # 检查train_dataloaders是否有sampler属性
+            if hasattr(train_dataloaders, 'sampler') and hasattr(train_dataloaders.sampler, 'set_epoch'):
+                train_dataloaders.sampler.set_epoch(epoch)
+            # 如果train_dataloaders是DataLoader列表，则为每个DataLoader设置epoch
+            elif isinstance(train_dataloaders, list):
+                for loader in train_dataloaders:
+                    if hasattr(loader, 'sampler') and hasattr(loader.sampler, 'set_epoch'):
+                        loader.sampler.set_epoch(epoch)
 
         for data in metric_logger.log_every(train_dataloaders,1):
             inputs, labels = data['image'], data['label']
@@ -448,13 +462,21 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
             # input prompt
             input_keys = ['box','point','noise_mask']
             labels_box = misc.masks_to_boxes(labels[:,0,:,:])
+            # 确保labels_box在正确的设备上
+            labels_box = labels_box.to(device)
+            
             try:
                 labels_points = misc.masks_sample_points(labels[:,0,:,:])
+                # 确保labels_points在正确的设备上
+                labels_points = labels_points.to(device)
             except:
                 # less than 10 points
                 input_keys = ['box','noise_mask']
+                
             labels_256 = F.interpolate(labels, size=(256, 256), mode='bilinear')
             labels_noisemask = misc.masks_noise(labels_256)
+            # 确保labels_noisemask在正确的设备上
+            labels_noisemask = labels_noisemask.to(device)
 
             batched_input = []
             for b_i in range(len(imgs)):
@@ -467,7 +489,7 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
                 elif input_type == 'point':
                     point_coords = labels_points[b_i:b_i+1]
                     dict_input['point_coords'] = point_coords
-                    dict_input['point_labels'] = torch.ones(point_coords.shape[1], device=point_coords.device)[None,:]
+                    dict_input['point_labels'] = torch.ones(point_coords.shape[1], device=device)[None,:]
                 elif input_type == 'noise_mask':
                     dict_input['mask_inputs'] = labels_noisemask[b_i:b_i+1]
                 else:
@@ -517,7 +539,14 @@ def train(args, net, optimizer, train_dataloaders, valid_dataloaders, lr_schedul
         train_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
 
         lr_scheduler.step()
+        # 在训练过程中仅使用默认阈值(0.0)进行评估，不进行多阈值评估
+        # 保存原始阈值设置
+        original_threshold_values = args.threshold_values
+        # 设置为只使用第一个阈值
+        args.threshold_values = [args.threshold_values[0]]
         test_stats = evaluate(args, net, sam, valid_dataloaders)
+        # 恢复原始设置
+        args.threshold_values = original_threshold_values
         train_stats.update(test_stats)
         
         net.train()  
@@ -572,6 +601,15 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
     net.eval()
     print("Validating...")
     test_stats = {}
+    device = args.device
+    
+    # 获取阈值列表
+    thresholds = args.threshold_values
+    print(f"使用阈值: {thresholds}")
+    
+    # 使用第一个阈值作为主要指标值
+    main_threshold = thresholds[0]
+    print(f"使用 {main_threshold} 作为主要评估指标阈值")
 
     for k in range(len(valid_dataloaders)):
         metric_logger = misc.MetricLogger(delimiter="  ")
@@ -581,19 +619,22 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
         for data_val in metric_logger.log_every(valid_dataloader,1000):
             imidx_val, inputs_val, labels_val, shapes_val, labels_ori = data_val['imidx'], data_val['image'], data_val['label'], data_val['shape'], data_val['ori_label']
 
-            if torch.cuda.is_available():
-                inputs_val = inputs_val.cuda()
-                labels_val = labels_val.cuda()
-                labels_ori = labels_ori.cuda()
+            # 确保所有输入都在正确的设备上
+            inputs_val = inputs_val.to(device)
+            labels_val = labels_val.to(device)
+            labels_ori = labels_ori.to(device)
 
             imgs = inputs_val.permute(0, 2, 3, 1).cpu().numpy()
             
+            # 确保labels_box在正确的设备上
             labels_box = misc.masks_to_boxes(labels_val[:,0,:,:])
+            labels_box = labels_box.to(device)
+            
             input_keys = ['box']
             batched_input = []
             for b_i in range(len(imgs)):
                 dict_input = dict()
-                input_image = torch.as_tensor(imgs[b_i].astype(dtype=np.uint8), device=sam.device).permute(2, 0, 1).contiguous()
+                input_image = torch.as_tensor(imgs[b_i].astype(dtype=np.uint8), device=device).permute(2, 0, 1).contiguous()
                 dict_input['image'] = input_image 
                 input_type = random.choice(input_keys)
                 if input_type == 'box':
@@ -601,7 +642,7 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
                 elif input_type == 'point':
                     point_coords = labels_points[b_i:b_i+1]
                     dict_input['point_coords'] = point_coords
-                    dict_input['point_labels'] = torch.ones(point_coords.shape[1], device=point_coords.device)[None,:]
+                    dict_input['point_labels'] = torch.ones(point_coords.shape[1], device=device)[None,:]
                 elif input_type == 'noise_mask':
                     dict_input['mask_inputs'] = labels_noisemask[b_i:b_i+1]
                 else:
@@ -628,23 +669,42 @@ def evaluate(args, net, sam, valid_dataloaders, visualize=False):
                 interm_embeddings=interm_embeddings,
             )
 
-            iou = compute_iou(masks_hq,labels_ori)
-            boundary_iou = compute_boundary_iou(masks_hq,labels_ori)
+            # 使用主阈值计算IoU (用于评估指标)
+            masks_hq_threshold = masks_hq > main_threshold
+            iou = compute_iou(masks_hq_threshold.float(), labels_ori)
+            boundary_iou = compute_boundary_iou(masks_hq_threshold.float(), labels_ori)
 
             if visualize:
                 print("visualize")
                 os.makedirs(args.output, exist_ok=True)
-                masks_hq_vis = (F.interpolate(masks_hq.detach(), (1024, 1024), mode="bilinear", align_corners=False) > 0).cpu()
-                for ii in range(len(imgs)):
-                    base = data_val['imidx'][ii].item()
-                    print('base:', base)
-                    save_base = os.path.join(args.output, str(k)+'_'+ str(base))
-                    imgs_ii = imgs[ii].astype(dtype=np.uint8)
-                    show_iou = torch.tensor([iou.item()])
-                    show_boundary_iou = torch.tensor([boundary_iou.item()])
-                    show_anns(masks_hq_vis[ii], None, labels_box[ii].cpu(), None, save_base , imgs_ii, show_iou, show_boundary_iou)
-                       
-
+                
+                # 对每个阈值进行评估和可视化
+                for threshold_val in thresholds:
+                    # 如果有多个阈值，为每个阈值创建子目录
+                    if len(thresholds) > 1:
+                        threshold_dir = os.path.join(args.output, f'threshold_{threshold_val}')
+                        os.makedirs(threshold_dir, exist_ok=True)
+                        save_dir = threshold_dir
+                    else:
+                        save_dir = args.output
+                    
+                    # 使用当前阈值进行预测
+                    masks_hq_vis = (F.interpolate(masks_hq.detach(), (1024, 1024), mode="bilinear", align_corners=False) > threshold_val).cpu()
+                    
+                    # 使用该阈值计算IoU
+                    masks_hq_threshold = masks_hq > threshold_val
+                    threshold_iou = compute_iou(masks_hq_threshold.float(), labels_ori)
+                    threshold_boundary_iou = compute_boundary_iou(masks_hq_threshold.float(), labels_ori)
+                    
+                    for ii in range(len(imgs)):
+                        base = data_val['imidx'][ii].item()
+                        save_base = os.path.join(save_dir, str(k)+'_'+ str(base))
+                        imgs_ii = imgs[ii].astype(dtype=np.uint8)
+                        show_iou = torch.tensor([threshold_iou.item()])
+                        show_boundary_iou = torch.tensor([threshold_boundary_iou.item()])
+                        show_anns(masks_hq_vis[ii], None, labels_box[ii].cpu(), None, save_base, imgs_ii, show_iou, show_boundary_iou)
+                        print(f'图片 {base}, 阈值 {threshold_val}: IoU={threshold_iou.item():.4f}, Boundary IoU={threshold_boundary_iou.item():.4f}')
+                    
             loss_dict = {"val_iou_"+str(k): iou, "val_boundary_iou_"+str(k): boundary_iou}
             loss_dict_reduced = misc.reduce_dict(loss_dict)
             metric_logger.update(**loss_dict_reduced)
@@ -666,74 +726,21 @@ if __name__ == "__main__":
     ### --------------- Configuring the Train and Valid datasets ---------------
 
     dataset_dis = {"name": "DIS5K-TR",
-                 "im_dir": "./data/DIS5K/DIS-TR/im",
-                 "gt_dir": "./data/DIS5K/DIS-TR/gt",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_thin = {"name": "ThinObject5k-TR",
-                 "im_dir": "./data/thin_object_detection/ThinObject5K/images_train",
-                 "gt_dir": "./data/thin_object_detection/ThinObject5K/masks_train",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_fss = {"name": "FSS",
-                 "im_dir": "./data/cascade_psp/fss_all",
-                 "gt_dir": "./data/cascade_psp/fss_all",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_duts = {"name": "DUTS-TR",
-                 "im_dir": "./data/cascade_psp/DUTS-TR",
-                 "gt_dir": "./data/cascade_psp/DUTS-TR",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_duts_te = {"name": "DUTS-TE",
-                 "im_dir": "./data/cascade_psp/DUTS-TE",
-                 "gt_dir": "./data/cascade_psp/DUTS-TE",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_ecssd = {"name": "ECSSD",
-                 "im_dir": "./data/cascade_psp/ecssd",
-                 "gt_dir": "./data/cascade_psp/ecssd",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_msra = {"name": "MSRA10K",
-                 "im_dir": "./data/cascade_psp/MSRA_10K",
-                 "gt_dir": "./data/cascade_psp/MSRA_10K",
+                 "im_dir": "/Volumes/data1/JH/projects/JLD_imgprocess/dataset/img",
+                 "gt_dir": "/Volumes/data1/JH/projects/JLD_imgprocess/dataset/label",
                  "im_ext": ".jpg",
                  "gt_ext": ".png"}
 
     # valid set
-    dataset_coift_val = {"name": "COIFT",
-                 "im_dir": "./data/thin_object_detection/COIFT/images",
-                 "gt_dir": "./data/thin_object_detection/COIFT/masks",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_hrsod_val = {"name": "HRSOD",
-                 "im_dir": "./data/thin_object_detection/HRSOD/images",
-                 "gt_dir": "./data/thin_object_detection/HRSOD/masks_max255",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
-
-    dataset_thin_val = {"name": "ThinObject5k-TE",
-                 "im_dir": "./data/thin_object_detection/ThinObject5K/images_test",
-                 "gt_dir": "./data/thin_object_detection/ThinObject5K/masks_test",
-                 "im_ext": ".jpg",
-                 "gt_ext": ".png"}
 
     dataset_dis_val = {"name": "DIS5K-VD",
-                 "im_dir": "./data/DIS5K/DIS-VD/im",
-                 "gt_dir": "./data/DIS5K/DIS-VD/gt",
+                 "im_dir": "/Volumes/data1/JH/projects/JLD_imgprocess/val/img",
+                 "gt_dir": "/Volumes/data1/JH/projects/JLD_imgprocess/val/label",
                  "im_ext": ".jpg",
                  "gt_ext": ".png"}
 
-    train_datasets = [dataset_dis, dataset_thin, dataset_fss, dataset_duts, dataset_duts_te, dataset_ecssd, dataset_msra]
-    valid_datasets = [dataset_dis_val, dataset_coift_val, dataset_hrsod_val, dataset_thin_val] 
+    train_datasets = [dataset_dis]
+    valid_datasets = [dataset_dis_val] 
 
     args = get_args_parser()
     net = MaskDecoderHQ(args.model_type) 
