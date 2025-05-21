@@ -322,3 +322,5 @@ Related high-quality instance segmentation work:
 ## python train/train.py --output ./output --model-type vit_l --checkpoint ./pretrained_checkpoint/sam_vit_l.pth --device cuda --finetune_vit --vit_learning_rate 1e-5 --freeze_image_encoder_layers 8
 ## python train/train.py --output ./output --model-type vit_l --checkpoint ./pretrained_checkpoint/sam_vit_l.pth --device cuda --finetune_vit --vit_learning_rate 1e-5 --gradient_accumulation_steps 4 --lr_scheduler cosine --warmup_epochs 1
 ## python train/train.py --output ./output --model-type vit_l --checkpoint ./pretrained_checkpoint/sam_vit_l.pth --device cuda --finetune_vit --vit_learning_rate 1e-5
+
+## python train.py --device mps --checkpoint work_dirs/hq_sam_b/sam_vit_finetuned_epoch_11.pth --restore-model work_dirs/hq_sam_b/epoch_11.pth --model-type vit_b --output work_dirs/hq_sam_b/visual/ --threshold_values 0.3 0.5 0.7 --visualize --eval

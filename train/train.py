@@ -285,7 +285,7 @@ def get_args_parser():
     parser.add_argument('--learning_rate', default=1e-3, type=float)
     parser.add_argument('--start_epoch', default=0, type=int)
     parser.add_argument('--lr_drop_epoch', default=10, type=int)
-    parser.add_argument('--max_epoch_num', default=12, type=int)
+    parser.add_argument('--max_epoch_num', default=120, type=int)
     parser.add_argument('--input_size', default=[1024,1024], type=list)
     parser.add_argument('--batch_size_train', default=4, type=int)
     parser.add_argument('--batch_size_valid', default=1, type=int)
@@ -667,17 +667,23 @@ def train(args, net, sam, optimizer, train_dataloaders, valid_dataloaders, lr_sc
             sam.eval()
 
         if epoch % args.model_save_fre == 0:
-            # 保存HQ-Decoder模型
-            model_name = "/epoch_"+str(epoch)+".pth"
+            # 获取当前的训练损失和验证IoU值用于文件名
+            current_loss = train_stats.get('training_loss', 0.0)
+            # 获取第一个验证集的IoU和boundary IoU (如果有)
+            val_iou = train_stats.get('val_iou_0', 0.0)
+            val_boundary_iou = train_stats.get('val_boundary_iou_0', 0.0)
+            
+            # 保存HQ-Decoder模型，添加loss和iou信息到文件名
+            model_name = f"/epoch_{epoch}_loss_{current_loss:.4f}_iou_{val_iou:.4f}_biou_{val_boundary_iou:.4f}.pth"
             print('保存HQ-Decoder模型到', args.output + model_name)
             if hasattr(net, 'module'):
                 misc.save_on_master(net.module.state_dict(), args.output + model_name)
             else:
                 misc.save_on_master(net.state_dict(), args.output + model_name)
             
-            # 如果微调了ViT，也保存完整的SAM模型
+            # 如果微调了ViT，也保存完整的SAM模型，同样添加loss和iou信息
             if args.finetune_vit:
-                sam_model_name = "/sam_vit_finetuned_epoch_"+str(epoch)+".pth"
+                sam_model_name = f"/sam_vit_finetuned_epoch_{epoch}_loss_{current_loss:.4f}_iou_{val_iou:.4f}_biou_{val_boundary_iou:.4f}.pth"
                 print('保存微调后的SAM模型到', args.output + sam_model_name)
                 if hasattr(sam, 'module'):
                     misc.save_on_master(sam.module.state_dict(), args.output + sam_model_name)
@@ -700,17 +706,46 @@ def train(args, net, sam, optimizer, train_dataloaders, valid_dataloaders, lr_sc
             sam_ckpt = torch.load(args.checkpoint)
             
         # 加载最终的HQ-Decoder
-        hq_decoder = torch.load(args.output + model_name)
+        # 找到最后一个保存的模型文件 (使用最后一个epoch的模型)
+        import glob
+        model_files = glob.glob(args.output + "/epoch_*.pth")
+        # 按epoch号排序
+        model_files.sort(key=lambda x: int(x.split('_')[1].split('loss')[0]))
+        last_model = model_files[-1] if model_files else None
         
-        # 合并HQ-Decoder到SAM模型
-        for key in hq_decoder.keys():
-            sam_key = 'mask_decoder.'+key
-            if sam_key not in sam_ckpt.keys():
-                sam_ckpt[sam_key] = hq_decoder[key]
+        if last_model:
+            print(f"加载最终HQ-Decoder模型: {last_model}")
+            hq_decoder = torch.load(last_model)
+            
+            # 合并HQ-Decoder到SAM模型
+            for key in hq_decoder.keys():
+                sam_key = 'mask_decoder.'+key
+                if sam_key not in sam_ckpt.keys():
+                    sam_ckpt[sam_key] = hq_decoder[key]
+            
+            # 从最后一个模型文件名提取训练指标
+            try:
+                # 从文件名中提取评估指标
+                filename_parts = os.path.basename(last_model).split('_')
+                loss_part = [p for p in filename_parts if 'loss' in p][0]
+                iou_part = [p for p in filename_parts if 'iou' in p and 'biou' not in p][0]
+                biou_part = [p for p in filename_parts if 'biou' in p][0]
                 
-        # 保存最终的完整模型
-        model_name = "/sam_hq_final.pth"
-        torch.save(sam_ckpt, args.output + model_name)
+                loss_value = loss_part.replace('loss', '').replace('.pth', '')
+                iou_value = iou_part.replace('iou', '').replace('.pth', '')
+                biou_value = biou_part.replace('biou', '').replace('.pth', '')
+                
+                # 添加性能指标到最终模型文件名
+                model_name = f"/sam_hq_final_loss_{loss_value}_iou_{iou_value}_biou_{biou_value}.pth"
+            except:
+                # 如果解析失败，使用默认名称
+                model_name = "/sam_hq_final.pth"
+                
+            # 保存最终的完整模型
+            torch.save(sam_ckpt, args.output + model_name)
+            print(f"保存最终合并模型到: {args.output + model_name}")
+        else:
+            print("警告: 未找到HQ-Decoder模型文件，无法创建最终合并模型")
 
 
 
